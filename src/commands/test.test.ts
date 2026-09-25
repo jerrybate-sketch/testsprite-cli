@@ -232,6 +232,8 @@ describe('createTestCommand — surface', () => {
       '--cursor',
       '--rerun',
       '--no-rerun',
+      // DEV-1306: filter history by the credentials-supplying environment.
+      '--env',
       '--columns',
       '--no-header',
     ]);
@@ -1576,6 +1578,7 @@ describe('runCodeGet', () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-shape-'));
     const target = join(dir, 'existing.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is inside this test's own mkdtempSync directory, never user input.
     writeFileSync(target, 'keep the original');
     const withoutCode: Record<string, unknown> = { ...TEST_CODE_INLINE };
     delete withoutCode.code;
@@ -1586,7 +1589,9 @@ describe('runCodeGet', () => {
         { credentialsPath, fetchImpl },
       ),
     ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is the fixture path created inside this test's own temp directory.
     expect(readFileSync(target, 'utf8')).toBe('keep the original');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- dir is created by this test's mkdtempSync call, never user input.
     expect(readdirSync(dir)).toEqual(['existing.json']);
   });
 
@@ -1630,6 +1635,7 @@ describe('runCodeGet', () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-version-'));
     const codeFile = join(dir, 'replacement.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- codeFile is a fixture inside this test's own mkdtempSync directory.
     writeFileSync(codeFile, 'print("replacement")');
     const methods: string[] = [];
     const fetchImpl = makeFetch((_url, init) => {

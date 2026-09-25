@@ -12,9 +12,11 @@ import {
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
   LIST_RUNS_RESPONSE_SCHEMA,
   ME_IDENTITY_SCHEMA,
+  ME_RESPONSE_SCHEMA,
   RERUN_RESPONSE_SCHEMA,
   RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
+  USAGE_RESPONSE_SCHEMA,
 } from './response-schemas.js';
 
 const VALID_RUN = {
@@ -445,5 +447,158 @@ describe('BATCH_RUN_FRESH_RESPONSE_SCHEMA — project-level dashboardUrl contrac
       expect(parsed.output.dashboardUrl).toBe(
         'https://portal.example.com/dashboard-v3/o/org-1/projects/p1',
       );
+  });
+});
+
+describe('DEV-1303 environment stamp — optional on every run-shaped payload', () => {
+  const HISTORY_ROW_BASE = {
+    runId: 'run_1',
+    status: 'passed',
+    source: 'cli',
+    isRerun: false,
+    createdFrom: null,
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: null,
+    finishedAt: '2026-06-01T10:00:30.000Z',
+    codeVersion: 'v1',
+    failureKind: null,
+  };
+
+  it('history row: accepts environment, with a null targetUrlSource on a V3 row', () => {
+    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
+      runs: [
+        {
+          ...HISTORY_ROW_BASE,
+          targetUrl: 'http://127.0.0.1:55015',
+          // V3: the environment IS the target — there is no separate provenance.
+          targetUrlSource: null,
+          environment: { id: 'env_1', name: 'local-dev' },
+        },
+        { ...HISTORY_ROW_BASE, environment: null },
+        HISTORY_ROW_BASE,
+      ],
+      nextCursor: null,
+      meta: {},
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.runs[0]!.environment).toEqual({ id: 'env_1', name: 'local-dev' });
+      expect(parsed.output.runs[1]!.environment).toBeNull();
+      // Absent stays absent — no default materialised.
+      expect('environment' in parsed.output.runs[2]!).toBe(false);
+    }
+  });
+
+  it('GET /runs/{id} and POST /runs accept `environment` and stay valid without it', () => {
+    const run = v.safeParse(RUN_RESPONSE_SCHEMA, {
+      ...VALID_RUN,
+      environment: { id: 'env_1', name: 'demo' },
+    });
+    expect(run.success).toBe(true);
+    expect(v.safeParse(RUN_RESPONSE_SCHEMA, VALID_RUN).success).toBe(true);
+
+    const trigger = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, {
+      runId: 'run_1',
+      status: 'queued',
+      enqueuedAt: '2026-06-01T10:00:00.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      environment: { id: 'env_1', name: 'demo' },
+    });
+    expect(trigger.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account surfaces (issue #277): GET /me and its usage projection.
+// ---------------------------------------------------------------------------
+
+const VALID_ME = {
+  userId: 'u_1',
+  keyId: 'k_1',
+  scopes: ['read:projects', 'read:tests'],
+  env: 'development',
+};
+
+describe('ME_RESPONSE_SCHEMA', () => {
+  it('accepts the minimal /me body and preserves unknown extra keys', () => {
+    const parsed = v.safeParse(ME_RESPONSE_SCHEMA, { ...VALID_ME, plan: 'Pro' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect((parsed.output as { plan?: string }).plan).toBe('Pro');
+    }
+  });
+
+  it('accepts an unknown env value (a new deployment tier must not hard-fail)', () => {
+    expect(v.safeParse(ME_RESPONSE_SCHEMA, { ...VALID_ME, env: 'sandbox' }).success).toBe(true);
+  });
+
+  it('leaves the absent-safe identity fields absent rather than defaulting them', () => {
+    const parsed = v.safeParse(ME_RESPONSE_SCHEMA, VALID_ME);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect('email' in parsed.output).toBe(false);
+      expect('displayName' in parsed.output).toBe(false);
+      expect('v3Enabled' in parsed.output).toBe(false);
+    }
+  });
+
+  it('rejects a /me body without scopes, naming the path', () => {
+    const withoutScopes: Record<string, unknown> = { ...VALID_ME };
+    delete withoutScopes.scopes;
+    const parsed = v.safeParse(ME_RESPONSE_SCHEMA, withoutScopes);
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.issues.some(issue => v.getDotPath(issue) === 'scopes')).toBe(true);
+    }
+  });
+});
+
+describe('ME_IDENTITY_SCHEMA', () => {
+  it("accepts doctor's partial identity projection (connectivity must not fail on it)", () => {
+    expect(v.safeParse(ME_IDENTITY_SCHEMA, { userId: 'u-doc', keyId: 'k-doc' }).success).toBe(true);
+  });
+
+  it('carries v3Enabled through so the routing advisory still fires', () => {
+    const parsed = v.safeParse(ME_IDENTITY_SCHEMA, { ...VALID_ME, v3Enabled: true });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.v3Enabled).toBe(true);
+    }
+  });
+
+  it('rejects a wrongly-typed identity field', () => {
+    expect(v.safeParse(ME_IDENTITY_SCHEMA, { userId: 42 }).success).toBe(false);
+  });
+});
+
+describe('USAGE_RESPONSE_SCHEMA', () => {
+  it("accepts today's /me body, which carries no credits fields at all", () => {
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, VALID_ME);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.credits).toBeUndefined();
+      // `scopes` is not part of the usage projection but must survive as an
+      // unknown extra key so `--output json` stays byte-faithful.
+      expect((parsed.output as { scopes?: string[] }).scopes).toEqual(VALID_ME.scopes);
+    }
+  });
+
+  it('accepts the future body with credits, plan and per-run cost', () => {
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, {
+      ...VALID_ME,
+      credits: 100,
+      subPlan: 'Standard',
+      creditsPerRun: 2,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects a non-numeric credit balance instead of rendering NaN math', () => {
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, { ...VALID_ME, credits: '100' });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.issues.some(issue => v.getDotPath(issue) === 'credits')).toBe(true);
+    }
   });
 });

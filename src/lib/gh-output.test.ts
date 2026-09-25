@@ -72,9 +72,13 @@ describe('summarizeAcceptedPayload', () => {
         notFound: ['test_nf'],
       }),
     );
-    // 1 accepted-passed + 3 not-dispatched → NOT reported as "1/1 passed".
+    // 1 accepted-passed + 3 not-dispatched → NOT reported as "1/1 passed",
+    // but the never-dispatched rows count as `skipped`, not `failed`:
+    // nothing ran and failed, and a `failed` count the exit-code gates disagree
+    // with is exactly the summary-contradicts-the-exit bug.
     expect(summary).toMatchObject({ total: 4, passed: 1, timedOut: 0 });
-    expect(summary.failed).toBe(3);
+    expect(summary.failed).toBe(0);
+    expect(summary.skipped).toBe(3);
     expect(summary.runs.map(r => r.status)).toEqual([
       'passed',
       'deferred',
@@ -96,7 +100,20 @@ describe('summarizeAcceptedPayload', () => {
         notFound: [],
       }),
     );
-    expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, timedOut: 0 });
+    expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0 });
+  });
+
+  it('a mixed batch keeps `failed` for dispatched non-passes only (measured repro shape)', () => {
+    // The ticket's reproduction: test_1 accepted+passed, test_2 conflicted.
+    // The artifact must not claim `failed: 1` while the batch's own summary
+    // (and possibly the exit code) says nothing failed.
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [{ testId: 'test_1', runId: 'run_1', status: 'passed' }],
+        conflicts: [{ testId: 'test_2', currentRunId: 'run_2' }],
+      }),
+    );
+    expect(summary).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1, timedOut: 0 });
   });
 });
 
@@ -146,7 +163,7 @@ describe('summarizeSingleRun', () => {
 describe('renderJobSummaryMarkdown', () => {
   it('renders the counts headline and one table row per run', () => {
     const md = renderJobSummaryMarkdown(summarizeAcceptedPayload(PAYLOAD));
-    expect(md).toContain('**1/3 passed** (1 failed, 1 timed out)');
+    expect(md).toContain('**1/3 passed** (1 failed, 0 skipped, 1 timed out)');
     // test_a has dashboardUrl but no executionUrl: the title (id fallback) links
     // to the test-case page; the Run cell shows the raw runId (no execution link).
     expect(md).toContain('| [test_a](https://portal.example.com/a) | passed | run_a |');
@@ -158,6 +175,7 @@ describe('renderJobSummaryMarkdown', () => {
       total: 1,
       passed: 0,
       failed: 1,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -215,6 +233,32 @@ describe('emitGithubOutputs', () => {
     expect(annotations[1]).toContain('test_c');
   });
 
+  it('never-dispatched rows annotate as ::warning::, dispatched failures as ::error::', () => {
+    const { stdout, sinks } = makeSinks();
+    const mixed = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [
+          { testId: 'test_pass', runId: 'r1', status: 'passed' },
+          { testId: 'test_fail', runId: 'r2', status: 'failed' },
+        ],
+        conflicts: [{ testId: 'test_conf', currentRunId: 'r3' }],
+        notFound: ['test_nf'],
+        deferred: [{ testId: 'test_def' }],
+      }),
+    );
+    emitGithubOutputs(mixed, { GITHUB_ACTIONS: 'true' }, sinks);
+    // A red ::error:: on a green job is the checks-tab half of the same
+    // contradiction — only the genuinely-failed run may carry it.
+    const errors = stdout.filter(line => line.startsWith('::error'));
+    const warnings = stdout.filter(line => line.startsWith('::warning'));
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('test_fail');
+    expect(warnings).toHaveLength(3);
+    expect(warnings.join('\n')).toContain('test_conf');
+    expect(warnings.join('\n')).toContain('test_nf');
+    expect(warnings.join('\n')).toContain('test_def');
+  });
+
   it('emits nothing off-CI, and a broken summary file downgrades to stderr', () => {
     const offCi = makeSinks();
     emitGithubOutputs(summary, {}, offCi.sinks);
@@ -267,6 +311,7 @@ describe('emitGithubOutputs', () => {
       total: 1,
       passed: 0,
       failed: 1,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -401,6 +446,7 @@ describe('test title in CI output', () => {
       total: 2,
       passed: 2,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       runs: [
         { testId: 't-1', title: 'Sign in from the login page', status: 'passed', runId: 'r-1' },
@@ -416,6 +462,7 @@ describe('test title in CI output', () => {
       total: 1,
       passed: 0,
       failed: 1,
+      skipped: 0,
       timedOut: 0,
       runs: [{ testId: 't', title: 'evil|title\nfake', status: 'failed', runId: 'r' }],
     });
@@ -429,6 +476,7 @@ describe('test title in CI output', () => {
       total: 2,
       passed: 2,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       runs: [
         { testId: 't-1', title: '', status: 'passed', runId: 'r-1' },
@@ -447,6 +495,7 @@ describe('test title in CI output', () => {
         total: 2,
         passed: 0,
         failed: 2,
+        skipped: 0,
         timedOut: 0,
         runs: [
           { testId: 't-1', title: 'Sign in\nnow', status: 'failed', runId: 'r-1' },
@@ -501,6 +550,7 @@ describe('run-scoped execution link in CI output', () => {
       total: 1,
       passed: 1,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -523,6 +573,7 @@ describe('run-scoped execution link in CI output', () => {
       total: 1,
       passed: 1,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -548,6 +599,7 @@ describe('run-scoped execution link in CI output', () => {
       total: 1,
       passed: 1,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -574,6 +626,7 @@ describe('run-scoped execution link in CI output', () => {
       total: 1,
       passed: 1,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       // Plain (unlinked) cell — no dashboardUrl — exercises escapeTableCell alone.
       runs: [{ testId: 'a\\|b', status: 'passed', runId: 'r1' }],
@@ -590,6 +643,7 @@ describe('run-scoped execution link in CI output', () => {
       total: 1,
       passed: 1,
       failed: 0,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -612,6 +666,7 @@ describe('run-scoped execution link in CI output', () => {
         total: 1,
         passed: 0,
         failed: 1,
+        skipped: 0,
         timedOut: 0,
         runs: [
           {

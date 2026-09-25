@@ -2,10 +2,11 @@ import { randomUUID } from 'node:crypto';
 import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
-import { VERSION } from '../version.js';
+import { buildUserAgent } from './client-tag.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
+  CANCEL_RUN_RESPONSE_SCHEMA,
   LIST_RUNS_RESPONSE_SCHEMA,
   RERUN_RESPONSE_SCHEMA,
   RUN_RESPONSE_SCHEMA,
@@ -103,6 +104,12 @@ export interface HttpClientOptions {
    */
   onServerVersion?: (info: { minVersion?: string }) => void;
   /**
+   * Environment the client reads the optional `TESTSPRITE_CLIENT` tag from
+   * (see `client-tag.ts`) to build its User-Agent. Defaults to `process.env`;
+   * injectable so tests never depend on the developer's shell.
+   */
+  env?: NodeJS.ProcessEnv;
+  /**
    * Per-request wall-clock timeout in milliseconds applied to every outgoing
    * fetch. The signal fires independently of any caller-supplied signal — the
    * request aborts on whichever fires first.
@@ -160,7 +167,7 @@ export interface RequestOptions<T = unknown> {
    *
    * Wired by the typed run helpers only (`triggerRun`, `triggerRunWithMeta`,
    * `triggerRerun`, `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`,
-   * `listTestRuns`); generic `get`/`post`/... callers stay opt-in.
+   * `listTestRuns`, `cancelRun`); generic `get`/`post`/... callers stay opt-in.
    * sourceRef: response-schemas.ts.
    */
   schema?: v.GenericSchema<unknown, T>;
@@ -226,6 +233,21 @@ const MAX_ATTEMPTS_INTERNAL = 2;
 // `Retry-After` (e.g. 86400) can't hang the CLI inside the retry sleep.
 const MAX_RATE_LIMITED_DELAY_MS = 60_000;
 
+/**
+ * 429 reasons that name a STANDING condition rather than a passing throttle —
+ * e.g. the per-user cap on live tunnel bindings. Retrying cannot succeed until
+ * the caller frees the resource, so the retry budget is skipped and the
+ * server's nextAction (e.g. `testsprite tunnel stop`) surfaces immediately.
+ */
+export const STANDING_RATE_LIMIT_REASONS: ReadonlySet<string> = new Set(['tunnel_binding_limit']);
+
+/** True for a RATE_LIMITED error whose envelope names a standing condition. */
+export function isStandingRateLimit(err: ApiError): boolean {
+  if (err.code !== 'RATE_LIMITED') return false;
+  const reason = err.getDetail<string>('reason', (v): v is string => typeof v === 'string');
+  return reason !== undefined && STANDING_RATE_LIMIT_REASONS.has(reason);
+}
+
 const CONFLICT_DELAY_MS = 1000;
 const INTERNAL_DELAY_MS = 500;
 
@@ -257,7 +279,7 @@ export class HttpClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly fetchImpl: FetchImpl;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly random: () => number;
   private readonly onDebug?: (event: DebugEvent) => void;
   private readonly onTransition?: (msg: string) => void;
@@ -265,11 +287,14 @@ export class HttpClient {
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
   private readonly maxResponseBytes: number;
+  private readonly userAgent: string;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
     this.apiKey = options.apiKey;
     this.shutdownSignal = options.shutdownSignal;
+    // Resolved once: the tag is process-wide configuration, not per-request.
+    this.userAgent = buildUserAgent(options.env ?? process.env);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep = options.sleep ?? defaultSleep;
     this.random = options.random ?? Math.random;
@@ -505,14 +530,21 @@ export class HttpClient {
    * than `pageSize` rows while still yielding a non-null `nextCursor`.
    * That means "none in THIS window", not end-of-history.
    */
-  async listTestRuns(testId: string, query: ListRunsQuery): Promise<ListRunsResponse> {
+  async listTestRuns(
+    testId: string,
+    query: ListRunsQuery,
+    options: { signal?: AbortSignal; retry?: boolean } = {},
+  ): Promise<ListRunsResponse> {
     const q: Record<string, string | number | undefined> = {};
     if (query.cursor !== undefined) q.cursor = query.cursor;
     if (query.pageSize !== undefined) q.pageSize = query.pageSize;
     if (query.source !== undefined) q.source = query.source;
     if (query.since !== undefined) q.since = query.since;
+    if (query.environment !== undefined) q.environment = query.environment;
     return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
       query: q,
+      signal: options.signal,
+      retry: options.retry,
       schema: LIST_RUNS_RESPONSE_SCHEMA,
     });
   }
@@ -622,6 +654,7 @@ export class HttpClient {
   async cancelRun(runId: string, options?: { signal?: AbortSignal }): Promise<CancelRunResponse> {
     return this.post<CancelRunResponse>(`/runs/${encodeURIComponent(runId)}/cancel`, {
       signal: options?.signal,
+      schema: CANCEL_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
     });
   }
@@ -995,7 +1028,11 @@ export class HttpClient {
           durationMs,
         });
         const retryOnConflict = options.retryOnConflict !== false;
-        const retryOnRateLimit = options.retryOnRateLimit !== false;
+        // A standing-condition 429 skips the retry budget outright: its
+        // Retry-After says when a retry COULD first succeed if the caller
+        // frees the resource, not that the condition clears on its own.
+        const retryOnRateLimit =
+          options.retryOnRateLimit !== false && !isStandingRateLimit(apiError);
         const decision = allowRetry
           ? apiRetryDecision(
               apiError.code,
@@ -1047,7 +1084,7 @@ export class HttpClient {
     const headers: Record<string, string> = {
       'x-request-id': requestId,
       accept: 'application/json',
-      'user-agent': `testsprite-cli/${VERSION}`,
+      'user-agent': this.userAgent,
     };
     // The CLI v1 facade authenticates via `x-api-key`.
     // (securitySchemes.ApiKeyAuth). Sending only Authorization Bearer would be
@@ -1078,7 +1115,7 @@ export class HttpClient {
     return new Promise((resolve, reject) => {
       const onAbort = (): void => reject(signal.reason);
       signal.addEventListener('abort', onAbort, { once: true });
-      this.sleep(ms).then(
+      this.sleep(ms, signal).then(
         () => {
           signal.removeEventListener('abort', onAbort);
           resolve();
@@ -1507,8 +1544,19 @@ function backoffDelay(attempt: number, random: () => number): number {
   return Math.min(base + jitter, RETRY_MAX_DELAY_MS);
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function isAbortError(err: unknown): boolean {

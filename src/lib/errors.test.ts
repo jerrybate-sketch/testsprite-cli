@@ -3,10 +3,12 @@ import {
   ApiError,
   CLIError,
   ERROR_CODES,
+  InterruptError,
   NotImplementedError,
   RequestTimeoutError,
   TransportError,
   exitCodeFor,
+  extractNodeErrorCode,
   isAuthCode,
   isErrorCode,
   localValidationError,
@@ -24,6 +26,76 @@ describe('CLIError', () => {
   it('accepts a custom exit code', () => {
     expect(new CLIError('boom', 42).exitCode).toBe(42);
   });
+
+  // A bare CLIError (not ApiError/InterruptError/RequestTimeoutError)
+  // previously had no `code` at all, so the telemetry fallback branch and the
+  // `--output json` error envelope both had nothing to key on. Every CLIError
+  // now carries a stable machine code, defaulting to the out-of-catalog
+  // 'CLI_ERROR' bucket (same convention as InterruptError's 'INTERRUPTED' and
+  // RequestTimeoutError's 'REQUEST_TIMEOUT' — deliberately not in ERROR_CODES,
+  // since none of these are backend-issued codes).
+  it('defaults `code` to CLI_ERROR', () => {
+    const err = new CLIError('boom');
+    expect(err.code).toBe('CLI_ERROR');
+  });
+
+  it('accepts a custom code as the third constructor argument', () => {
+    const err = new CLIError('boom', 5, 'MY_CODE');
+    expect(err.code).toBe('MY_CODE');
+  });
+});
+
+describe('CLIError subclasses set a specific `code` (not the CLI_ERROR default)', () => {
+  it('InterruptError.code is INTERRUPTED', () => {
+    const err = new InterruptError('SIGINT');
+    expect(err.code).toBe('INTERRUPTED');
+  });
+
+  it('RequestTimeoutError.code is REQUEST_TIMEOUT', () => {
+    const err = new RequestTimeoutError(5_000);
+    expect(err.code).toBe('REQUEST_TIMEOUT');
+  });
+});
+
+// Regression pin (not a red/green TDD case — there is no unpatched behavior to
+// contrast against once CLIError gains a base `code` field; this exists purely
+// to lock in that ApiError's own `this.code = envelope.code` assignment keeps
+// winning over whatever CLIError's constructor would have defaulted it to).
+describe('ApiError.code overrides the CLIError base default', () => {
+  it('is the envelope code, never the CLI_ERROR base default', () => {
+    const err = ApiError.fromEnvelope({
+      error: {
+        code: 'NOT_FOUND',
+        message: 'gone',
+        nextAction: '',
+        requestId: 'req_1',
+        details: {},
+      },
+    });
+    expect(err.code).toBe('NOT_FOUND');
+    expect(err.code).not.toBe('CLI_ERROR');
+  });
+});
+
+describe('extractNodeErrorCode', () => {
+  it('returns the string `.code` off an arbitrary thrown object', () => {
+    const err = Object.assign(new Error('no such file'), { code: 'ENOENT' });
+    expect(extractNodeErrorCode(err)).toBe('ENOENT');
+  });
+
+  it('returns undefined when there is no `.code`', () => {
+    expect(extractNodeErrorCode(new Error('plain'))).toBeUndefined();
+  });
+
+  it('returns undefined for non-string `.code` values', () => {
+    expect(extractNodeErrorCode({ code: 42 })).toBeUndefined();
+  });
+
+  it('returns undefined for non-object thrown values', () => {
+    expect(extractNodeErrorCode('a string was thrown')).toBeUndefined();
+    expect(extractNodeErrorCode(null)).toBeUndefined();
+    expect(extractNodeErrorCode(undefined)).toBeUndefined();
+  });
 });
 
 describe('NotImplementedError', () => {
@@ -33,6 +105,16 @@ describe('NotImplementedError', () => {
     expect(err.exitCode).toBe(2);
     expect(err.name).toBe('NotImplementedError');
     expect(err).toBeInstanceOf(CLIError);
+  });
+
+  // Its own dedicated code instead of inheriting the generic CLIError
+  // default — 'NOT_IMPLEMENTED' is a meaningful, already-known signal (this
+  // command path isn't wired up yet), so falling back to 'CLI_ERROR' would
+  // throw that information away.
+  it('uses NOT_IMPLEMENTED, not the CLIError base default', () => {
+    const err = new NotImplementedError('project list');
+    expect(err.code).toBe('NOT_IMPLEMENTED');
+    expect(err.code).not.toBe('CLI_ERROR');
   });
 });
 

@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   runTestlistAdd,
   runTestlistCreate,
@@ -14,6 +14,7 @@ import {
   waitRequestTimeoutMs,
 } from './testlist.js';
 import { ApiError, CLIError } from '../lib/errors.js';
+import { takeTelemetryExtras } from '../lib/telemetry.js';
 import type { CliTestListDetail } from '../lib/testlist.types.js';
 import type { RunResponse } from '../lib/runs.types.js';
 
@@ -494,7 +495,7 @@ describe('testlist run', () => {
     ).catch(e => e)) as CLIError;
     expect(err.exitCode).toBe(6);
     // The exit-6 is surfaced in CI (annotation + summary file), not a bare throw.
-    expect(stdout.some(l => l.startsWith('::error') && l.includes('case-a'))).toBe(true);
+    expect(stdout.some(l => l.startsWith('::warning') && l.includes('case-a'))).toBe(true);
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
     const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
       total: number;
@@ -502,7 +503,7 @@ describe('testlist run', () => {
       failed: number;
       runs: { testId: string; status: string }[];
     };
-    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 1 });
+    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 0, skipped: 1 });
     expect(artifact.runs.some(r => r.testId === 'case-a' && r.status === 'conflict')).toBe(true);
   });
 
@@ -542,10 +543,10 @@ describe('testlist run', () => {
       runs: { testId: string; status: string }[];
     };
     // Both non-dispatched members appear as non-passed rows (conflict + not_found).
-    expect(artifact).toMatchObject({ total: 2, failed: 2 });
+    expect(artifact).toMatchObject({ total: 2, failed: 0, skipped: 2 });
     expect(artifact.runs.some(r => r.testId === 'case-a' && r.status === 'conflict')).toBe(true);
     expect(artifact.runs.some(r => r.testId === 'ghost' && r.status === 'not_found')).toBe(true);
-    expect(stdout.some(l => l.startsWith('::error') && l.includes('ghost'))).toBe(true);
+    expect(stdout.some(l => l.startsWith('::warning') && l.includes('ghost'))).toBe(true);
   });
 
   it('all-conflict WITHOUT --wait under GITHUB_ACTIONS: emits nothing (the all-conflict emit is --wait-gated)', async () => {
@@ -786,7 +787,7 @@ describe('testlist run', () => {
       failed: number;
       runs: { testId: string; status: string; error?: string }[];
     };
-    expect(artifact).toMatchObject({ total: 2, passed: 1, failed: 1 });
+    expect(artifact).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1 });
     const notFoundRow = artifact.runs.find(r => r.testId === 'ghost');
     expect(notFoundRow?.status).toBe('not_found');
     // The cause is testlist-specific — NOT `test rerun`'s "no replayable run".
@@ -866,5 +867,99 @@ describe('testlist run', () => {
     expect(waitRequestTimeoutMs({ wait: true, timeoutSeconds: 600 })).toBe(600_000);
     // A small --timeout floors at the 120s default (never lowers it).
     expect(waitRequestTimeoutMs({ wait: true, timeoutSeconds: 30 })).toBe(120_000);
+  });
+});
+
+describe('testlist run — insufficient credits → exit 12 + telemetry facts', () => {
+  beforeEach(() => {
+    takeTelemetryExtras();
+  });
+  afterEach(() => {
+    takeTelemetryExtras();
+  });
+
+  const allCredits = {
+    accepted: [],
+    conflicts: [
+      {
+        testId: 'case-a',
+        reason: 'insufficient_credits',
+        message: 'Insufficient credits: need 1.',
+      },
+      { testId: 'case-b', reason: 'insufficient_credits' },
+    ],
+    deferred: [],
+  };
+
+  it.each([false, true])(
+    'wait=%s: nothing dispatched and every conflict insufficient_credits → INSUFFICIENT_CREDITS exit 12',
+    async wait => {
+      const { env } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: allCredits }));
+      const err = (await runTestlistRun(
+        { ...runBase, listId: 'list-1', wait },
+        { env, fetchImpl, stdout: () => {}, sleep: instantSleep },
+      ).catch(e => e)) as ApiError;
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.code).toBe('INSUFFICIENT_CREDITS');
+      expect(err.exitCode).toBe(12);
+      expect(err.message).toBe('Insufficient credits: need 1.');
+      expect(err.nextAction).toContain('/dashboard/settings/billing');
+      expect(takeTelemetryExtras()).toEqual({
+        accepted: 0,
+        conflicts: 2,
+        deferred: 0,
+        skipped: 0,
+        conflictReason: 'insufficient_credits',
+      });
+    },
+  );
+
+  it('a billing_hold all-conflict keeps exit 6 and is named in the message', async () => {
+    const { env } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        accepted: [],
+        conflicts: [{ testId: 'case-a', reason: 'billing_hold', message: 'Card declined.' }],
+        deferred: [],
+      },
+    }));
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1' },
+      { env, fetchImpl, stdout: () => {} },
+    ).catch(e => e)) as CLIError;
+    expect(err).toBeInstanceOf(CLIError);
+    expect(err.exitCode).toBe(6);
+    expect(err.message).toContain('1 billing hold');
+    expect(takeTelemetryExtras()).toMatchObject({ conflictReason: 'billing_hold' });
+  });
+
+  it('--wait records dispatch counts + disjoint verdict counts', async () => {
+    const { env } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: RUN_ACCEPTED };
+      return { body: makeRun('blocked') };
+    });
+    await runTestlistRun(
+      { ...runBase, listId: 'list-1', wait: true },
+      { env, fetchImpl, stdout: () => {}, sleep: instantSleep },
+    ).catch(() => undefined); // blocked → exit 1
+    expect(takeTelemetryExtras()).toEqual({
+      accepted: 1,
+      conflicts: 0,
+      deferred: 0,
+      skipped: 0,
+      passed: 0,
+      failed: 0,
+      blocked: 1,
+      timedOut: 0,
+    });
+  });
+
+  it('non-wait records dispatch counts only', async () => {
+    const { env } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: RUN_ACCEPTED }));
+    await runTestlistRun({ ...runBase, listId: 'list-1' }, { env, fetchImpl, stdout: () => {} });
+    expect(takeTelemetryExtras()).toEqual({ accepted: 1, conflicts: 0, deferred: 0, skipped: 0 });
   });
 });

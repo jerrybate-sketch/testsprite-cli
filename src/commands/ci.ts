@@ -13,6 +13,7 @@ import { type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
 import { assertNotLocal } from '../lib/target-url.js';
+import { recordTelemetryExtras } from '../lib/telemetry.js';
 import { VERSION } from '../version.js';
 import type { CliProject } from './project.js';
 
@@ -379,13 +380,6 @@ function trySetSecret(
 // ── orchestrator ─────────────────────────────────────────────────────────────
 
 export async function runCiInit(opts: CiInitOptions, deps: CiDeps = {}): Promise<void> {
-  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const fs = deps.fs ?? defaultCiFs;
-  const spawn = deps.spawn ?? defaultSpawn;
-  const cwd = deps.cwd ?? process.cwd();
-  const out = new Output(opts.output, { stdout, stderr });
-
   if (!SUPPORTED_PLATFORMS.includes(opts.platform as Platform)) {
     throw localValidationError(
       'platform',
@@ -395,6 +389,45 @@ export async function runCiInit(opts: CiInitOptions, deps: CiDeps = {}): Promise
     );
   }
   const platform = opts.platform as Platform;
+
+  // Telemetry facts for this invocation (see lib/telemetry.ts — low-cardinality
+  // only: never the path, the project id, or the filter). `workflowExisted` is
+  // learned only once the write is attempted, so it is filled in below and the
+  // whole set is recorded on every exit path, including a thrown error.
+  let workflowExisted: boolean | undefined;
+  try {
+    await runCiInitScaffold(opts, deps, platform, existed => {
+      workflowExisted = existed;
+    });
+  } finally {
+    recordTelemetryExtras({
+      platform,
+      force: opts.force,
+      projectResolved: opts.project ? 'flag' : 'auto',
+      ...(workflowExisted !== undefined ? { workflowExisted } : {}),
+    });
+  }
+}
+
+/**
+ * The scaffold proper (everything after platform validation). Reports whether a
+ * workflow file already existed at the target path via `onExisted` the moment
+ * that is known — BEFORE the `--force` decision throws or overwrites. Under
+ * `--dry-run` it returns before the write is attempted, so `onExisted` is never
+ * called and the fact stays unknown.
+ */
+async function runCiInitScaffold(
+  opts: CiInitOptions,
+  deps: CiDeps,
+  platform: Platform,
+  onExisted: (existed: boolean) => void,
+): Promise<void> {
+  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const fs = deps.fs ?? defaultCiFs;
+  const spawn = deps.spawn ?? defaultSpawn;
+  const cwd = deps.cwd ?? process.cwd();
+  const out = new Output(opts.output, { stdout, stderr });
 
   // Validate the caller's own inputs up front — BEFORE the project-list round
   // trip — so a bad --filter/--project fails fast without a wasted request.
@@ -465,6 +498,7 @@ export async function runCiInit(opts: CiInitOptions, deps: CiDeps = {}): Promise
   let wrote = true;
   try {
     await fs.writeFile(absPath, workflow, { exclusive: true });
+    onExisted(false);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'EISDIR') {
@@ -476,6 +510,7 @@ export async function runCiInit(opts: CiInitOptions, deps: CiDeps = {}): Promise
       );
     }
     if (code !== 'EEXIST') throw err;
+    onExisted(true);
     const prior = await fs.readFile(absPath);
     if (prior === workflow) {
       // Already exactly what we'd write — no rewrite, no `.bak` churn. This also

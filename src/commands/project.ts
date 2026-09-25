@@ -13,6 +13,14 @@ import {
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
+import {
+  assertStoredLocalTargetListening,
+  buildLocalTargetUrl,
+  DEFAULT_LOCAL_HOST,
+  parseStoredLocalTarget,
+  type LocalPortProbeDeps,
+  type StoredLocalTarget,
+} from '../lib/local-target.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { CLI_PROJECT_LIST_SCHEMA, CLI_PROJECT_SCHEMA } from '../lib/project-response-schema.js';
@@ -26,6 +34,7 @@ import {
   type Page,
   type PaginationFlags,
 } from '../lib/pagination.js';
+import { createProjectEnvCommand } from './project-env.js';
 
 export interface CliProject {
   id: string;
@@ -66,6 +75,8 @@ export interface CliProject {
    * (see the `project create --type backend` note in CLAUDE.md).
    */
   targetUrl?: string | null;
+  /** Present only when the stored project target is local to the developer machine. */
+  originMode?: 'local';
   /**
    * Project-level test-id attribute priority list (e.g. `['data-element',
    * 'data-testid']`). The execution engine tries these DOM attributes, in
@@ -121,6 +132,7 @@ export interface ProjectDeps {
   fetchImpl?: FetchImpl;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  localPortProbeDeps?: LocalPortProbeDeps;
   /** Graceful-detach coordinator (DEV-331); tests inject their own. */
   shutdown?: ShutdownHandle;
 }
@@ -199,6 +211,7 @@ export interface CliCreateProjectRequest {
   type: 'frontend' | 'backend';
   name: string;
   targetUrl?: string;
+  originMode?: 'local';
   // `description` is intentionally not part of the wire request — projects have
   // no description field. The `--description` flag is rejected client-side.
   username?: string;
@@ -233,6 +246,7 @@ export interface CliCreateProjectResponse {
   /** Absent-safe: not guaranteed on every backend response. */
   updatedAt?: string;
   targetUrl?: string;
+  originMode?: 'local';
 }
 
 /** Resolve the created project's id regardless of which field name the backend used. */
@@ -241,9 +255,14 @@ export function resolveCreatedProjectId(r: CliCreateProjectResponse): string | u
 }
 
 interface CreateOptions extends CommonOptions {
+  /** `'local'` marks the target as an app on the caller's own machine. */
+  originMode?: 'local';
   type: 'frontend' | 'backend';
   name: string;
   targetUrl?: string;
+  local?: string;
+  localHost?: string;
+  skipPreflight?: boolean;
   description?: string;
   testIdAttributes?: string[];
   username?: string;
@@ -286,17 +305,29 @@ export async function runCreate(
     );
   }
 
+  if (opts.local !== undefined && opts.type !== 'frontend') {
+    throw localValidationError('--local projects are frontend-only');
+  }
+  const localTarget = parseStoredLocalTarget({
+    local: opts.local,
+    localHost: opts.localHost,
+    url: opts.targetUrl,
+  });
+  const targetUrl = localTarget
+    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
+    : opts.targetUrl;
+
   // P2-7: guard --url against localhost/RFC1918/non-http(s) (same rules as
   // `test create --target-url`). Applies to both FE (required) and BE (optional).
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project create',
-      hintContext: 'bootstrap',
+      hintContext: 'local-project-create',
     });
   }
 
-  if (opts.type === 'frontend' && !opts.targetUrl) {
+  if (opts.type === 'frontend' && !targetUrl) {
     throw localValidationError('--url is required for --type frontend');
   }
 
@@ -322,13 +353,18 @@ export async function runCreate(
       id: 'p_dryrun_2026',
       type: opts.type,
       name: opts.name,
-      targetUrl: opts.targetUrl ?? '',
+      targetUrl: targetUrl ?? '',
+      ...(localTarget ? { originMode: 'local' } : {}),
       createdFrom: 'cli',
       createdAt: '2026-05-16T00:00:00.000Z',
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
     out.print(sample, data => renderCreateProjectText(data as CliCreateProjectResponse));
     return sample;
+  }
+
+  if (localTarget) {
+    await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
   }
 
   // Resolve password: flag > file > none
@@ -345,7 +381,8 @@ export async function runCreate(
   const body: CliCreateProjectRequest = {
     type: opts.type,
     name: opts.name,
-    ...(opts.targetUrl !== undefined ? { targetUrl: opts.targetUrl } : {}),
+    ...(targetUrl !== undefined ? { targetUrl } : {}),
+    ...(localTarget ? { originMode: 'local' } : {}),
     ...(opts.username !== undefined ? { username: opts.username } : {}),
     ...(password !== undefined ? { password } : {}),
     ...(opts.instruction !== undefined ? { instruction: opts.instruction } : {}),
@@ -371,7 +408,9 @@ export async function runCreate(
     ...(resolvedId !== undefined ? { projectId: resolvedId, id: resolvedId } : {}),
   };
 
-  out.print(created, data => renderCreateProjectText(data as CliCreateProjectResponse));
+  out.print(created, data =>
+    renderCreateProjectText(data as CliCreateProjectResponse, localTarget),
+  );
 
   // A backend project created without --url has no default environment URL.
   // On the V3 execution path, the shared admission guard (`runProjectGuarded`
@@ -449,6 +488,14 @@ interface UpdateOptions extends CommonOptions {
   projectId: string;
   name?: string;
   targetUrl?: string;
+  /**
+   * `--local <port>`: point the project at an app on this machine. The same
+   * spelling as `project create`; builds the loopback URL and sends the
+   * `originMode: 'local'` marker that lets the server store it.
+   */
+  local?: string;
+  localHost?: string;
+  skipPreflight?: boolean;
   username?: string;
   password?: string;
   passwordFile?: string;
@@ -481,12 +528,24 @@ export async function runUpdate(
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  // P2-7: guard --url against localhost/RFC1918/non-http(s).
+  // `--local <port>` is the one way to point a project at an app on this
+  // machine, on update exactly as on create. A loopback `--url` has no
+  // accepted form here and is redirected to `--local`. The project's type is
+  // not known client-side on update; the server refuses `--local` on a
+  // backend project.
+  const localTarget = parseStoredLocalTarget({
+    local: opts.local,
+    localHost: opts.localHost,
+    url: opts.targetUrl,
+  });
+  const targetUrl = localTarget
+    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
+    : opts.targetUrl;
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project update',
-      hintContext: 'bootstrap',
+      hintContext: 'local-project-create',
     });
   }
 
@@ -498,7 +557,7 @@ export async function runUpdate(
   const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
   const mutableFields: Record<string, boolean> = {
     name: opts.name !== undefined,
-    targetUrl: opts.targetUrl !== undefined,
+    targetUrl: targetUrl !== undefined,
     username: opts.username !== undefined,
     password: passwordSupplied,
     instruction: opts.instruction !== undefined,
@@ -533,8 +592,12 @@ export async function runUpdate(
       updatedFields: presentFieldNames,
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
-    out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse));
+    out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse, localTarget));
     return sample;
+  }
+
+  if (localTarget) {
+    await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
   }
 
   // Resolve password only on the real path. Dry-run must not touch the
@@ -551,7 +614,8 @@ export async function runUpdate(
 
   const bodyFields: Record<string, string | string[] | null | undefined> = {
     name: opts.name,
-    targetUrl: opts.targetUrl,
+    targetUrl,
+    originMode: localTarget ? 'local' : undefined,
     username: opts.username,
     password,
     instruction: opts.instruction,
@@ -585,7 +649,7 @@ export async function runUpdate(
       : {}),
   };
 
-  out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse));
+  out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse, localTarget));
   return updated;
 }
 
@@ -1396,9 +1460,18 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--name <name>', 'project name (required)')
     .option(
       '--url <url>',
-      'target URL (required for frontend; also required for backend on the V3 execution ' +
+      'target URL (required for frontend unless --local is used; also required for backend on the V3 execution ' +
         'path — see `auth status` for your routing)',
     )
+    .option(
+      '--local <port>',
+      'create a frontend project for an app on this machine (1-65535; excludes --url)',
+    )
+    .option(
+      '--local-host <host>',
+      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    )
+    .option('--skip-preflight', 'skip the local TCP listener check before project creation')
     .option(
       '--description <text>',
       'not supported — projects have no description (test-level descriptions are set on `test create`)',
@@ -1424,15 +1497,15 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       if (type !== 'frontend' && type !== 'backend') {
         throw localValidationError('--type must be frontend or backend');
       }
-      if (type === 'frontend' && !cmdOpts.url) {
-        throw localValidationError('--url is required for --type frontend');
-      }
       await runCreate(
         {
           ...resolveCommonOptions(command),
           type,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
+          local: cmdOpts.local,
+          localHost: cmdOpts.localHost,
+          skipPreflight: cmdOpts.skipPreflight,
           description: cmdOpts.description,
           username: cmdOpts.username,
           password: cmdOpts.password,
@@ -1452,7 +1525,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .command('update <project-id>')
     .description('Update project metadata')
     .option('--name <name>', 'new project name')
-    .option('--url <url>', 'new target URL')
+    .option('--url <url>', 'new target URL (public; for an app on this machine use --local)')
+    .option(
+      '--local <port>',
+      'point the project at an app on this machine (1-65535; excludes --url; frontend only)',
+    )
+    .option(
+      '--local-host <host>',
+      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    )
+    .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new auth username')
     .option('--password <pw>', 'new auth password')
     .option('--password-file <path>', 'read new password from file')
@@ -1479,6 +1561,9 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           projectId,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
+          local: cmdOpts.local,
+          localHost: cmdOpts.localHost,
+          skipPreflight: cmdOpts.skipPreflight,
           username: cmdOpts.username,
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
@@ -1656,6 +1741,9 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
   project.addCommand(docs);
+  // DEV-1305: `project env <verb>` — the per-project environment surface
+  // (credentials, URL, default). Own module; `deps` threaded so tests inject.
+  project.addCommand(createProjectEnvCommand(deps));
 
   return project;
 }
@@ -1679,6 +1767,9 @@ interface CreateFlagOpts {
   type?: string;
   name?: string;
   url?: string;
+  local?: string;
+  localHost?: string;
+  skipPreflight?: boolean;
   description?: string;
   username?: string;
   password?: string;
@@ -1691,6 +1782,9 @@ interface CreateFlagOpts {
 interface UpdateFlagOpts {
   name?: string;
   url?: string;
+  local?: string;
+  localHost?: string;
+  skipPreflight?: boolean;
   username?: string;
   password?: string;
   passwordFile?: string;
@@ -1809,23 +1903,33 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
       Math.max(3, ...rows.map(project => (project.orgName ?? project.orgId ?? '').length)),
     render: project => project.orgName ?? project.orgId ?? '',
   },
+  {
+    header: 'URL',
+    width: rows => Math.max(3, ...rows.map(project => renderProjectUrl(project).length)),
+    render: renderProjectUrl,
+  },
   { header: 'CREATED', width: 0, render: project => project.createdAt },
 ];
 
-const PROJECT_LIST_ORG_COLUMN = PROJECT_LIST_COLUMNS.find(c => c.header === 'ORG')!;
+function renderProjectUrl(project: CliProject): string {
+  const url = project.targetUrl ?? '';
+  return project.originMode === 'local' ? `${url ? `${url} ` : ''}(Local)` : url;
+}
 
 /**
  * Default (no explicit `--columns`) column set. ORG is included only when
- * at least one row in this page carries `orgId` — avoids widening the table
- * for callers whose projects have no org attribution at all.
+ * at least one row carries `orgId`; URL is included when a row is local.
+ * Older responses retain the existing default table columns.
  */
 function defaultProjectListColumns(
   rows: readonly CliProject[],
 ): ReadonlyArray<TextTableColumn<CliProject>> {
   const hasOrgInfo = rows.some(project => project.orgId !== undefined);
-  return hasOrgInfo
-    ? PROJECT_LIST_COLUMNS
-    : PROJECT_LIST_COLUMNS.filter(c => c !== PROJECT_LIST_ORG_COLUMN);
+  const hasLocalProject = rows.some(project => project.originMode === 'local');
+  return PROJECT_LIST_COLUMNS.filter(
+    column =>
+      (column.header !== 'ORG' || hasOrgInfo) && (column.header !== 'URL' || hasLocalProject),
+  );
 }
 
 function renderProjectListText(
@@ -1870,9 +1974,12 @@ function renderProjectText(p: CliProject): string {
   if ('targetUrl' in p) {
     lines.push(
       p.targetUrl
-        ? `targetUrl:   ${p.targetUrl}`
+        ? `targetUrl:   ${renderProjectUrl(p)}`
         : `targetUrl:   (not set — set one with: testsprite project update ${p.id} --url <url>)`,
     );
+  }
+  if (p.originMode === 'local' && !p.targetUrl) {
+    lines.push('originMode:  local (Local)');
   }
   // Presence-keyed like targetUrl: older backends don't report the field at all.
   if ('testIdAttributes' in p) {
@@ -1891,7 +1998,10 @@ function renderProjectText(p: CliProject): string {
  * field is proven reliable) because the create response's id field name and
  * `updatedAt` presence are not guaranteed — see `CliCreateProjectResponse`.
  */
-function renderCreateProjectText(p: CliCreateProjectResponse): string {
+function renderCreateProjectText(
+  p: CliCreateProjectResponse,
+  localTarget?: StoredLocalTarget,
+): string {
   const lines = [
     `id:          ${resolveCreatedProjectId(p) ?? '(unknown)'}`,
     `name:        ${p.name}`,
@@ -1900,15 +2010,38 @@ function renderCreateProjectText(p: CliCreateProjectResponse): string {
     `createdAt:   ${p.createdAt}`,
   ];
   if (p.updatedAt !== undefined) lines.push(`updatedAt:   ${p.updatedAt}`);
+  if (localTarget) {
+    const projectId = resolveCreatedProjectId(p) ?? '<project-id>';
+    const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
+    const hostFlag =
+      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
+    lines.push(
+      `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
+      'Next: write a plan and run it locally:',
+      `  In plan.json, set projectId to ${projectId}.`,
+      `  testsprite test create --project ${projectId} --plan-from plan.json`,
+      `  testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+      `Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update ${projectId} --url https://...`,
+    );
+  }
   return lines.join('\n');
 }
 
-function renderUpdateText(r: CliUpdateProjectResponse): string {
+function renderUpdateText(r: CliUpdateProjectResponse, localTarget?: StoredLocalTarget): string {
   const lines = [
     `id:            ${resolveUpdatedProjectId(r) ?? '(unknown)'}`,
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
   ];
   if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${r.updatedAt}`);
+  if (localTarget) {
+    const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
+    const hostFlag =
+      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
+    lines.push(
+      `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
+      `Run its tests with: testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+    );
+  }
   return lines.join('\n');
 }
 

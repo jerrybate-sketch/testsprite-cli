@@ -27,6 +27,8 @@ import type { FetchImpl } from '../lib/http.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import type { MeIdentityWire } from '../lib/response-schemas.js';
+import { ME_IDENTITY_SCHEMA } from '../lib/response-schemas.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
@@ -48,16 +50,14 @@ export interface DoctorReport {
   warnings: number;
 }
 
-/** Minimal projection of `GET /me` we read for the connectivity detail. */
-interface MeIdentity {
-  userId?: string;
-  keyId?: string;
-  v3Enabled?: boolean;
-  /** Account-wide membership list. Absent-safe (older backends omit it). */
-  organizations?: CliOrgSummary[];
-  /** The calling key's own org binding — membership keys only. */
-  org?: CliOrgBinding;
-}
+/**
+ * Minimal projection of `GET /me` we read for the connectivity detail.
+ *
+ * Aliased to the schema's wire type so the interface and
+ * {@link ME_IDENTITY_SCHEMA} cannot drift apart (issue #277). The org fields
+ * (`organizations`, `org`) live on {@link MeIdentityWire} for the same reason.
+ */
+type MeIdentity = MeIdentityWire;
 
 export interface DoctorDeps {
   env?: NodeJS.ProcessEnv;
@@ -244,7 +244,7 @@ async function checkConnectivity(
       fetchImpl: deps.fetchImpl,
       stderr: deps.stderr,
     });
-    const me = await client.get<MeIdentity>('/me');
+    const me = await client.get<MeIdentity>('/me', { schema: ME_IDENTITY_SCHEMA });
     const who = me.userId ? ` (userId ${me.userId})` : '';
     return {
       check: { name, status: 'ok', detail: `reached GET /me, API key accepted${who}` },

@@ -38,17 +38,31 @@ import { ApiError } from './errors.js';
 const LOCAL_DEV_RUNTIME_HINT =
   "This looks like a local-dev target. Run it with `testsprite test run <test-id> --local <port>` instead — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
 
-// Project/test creation happens before the caller necessarily has a test id
-// (and project create happens before they have a project at all). Lead those
-// callers through the required public project URL first, then name the per-run
-// loopback tunnel only after the test exists.
+// Creation-time callers that take a per-run target (`test create
+// --target-url`, which only applies with `--run`). A project or environment
+// that names an app on this machine is created with `--local <port>`, so this
+// says that instead of sending the reader after a public URL they may not have.
+// It also serves the bind-all addresses (`0.0.0.0` / `::`), which are not
+// loopback and are refused everywhere.
 const LOCAL_DEV_BOOTSTRAP_HINT =
-  "TestSprite executes tests from the cloud, so a project's URL must be an internet-reachable address the runner can use. " +
-  'Set the project to its deployed or staging URL. ' +
-  'After a test exists, target an app on this machine for an individual run with ' +
-  "`testsprite test run <test-id> --local <port>`; that tunnel is per-run and does not make localhost the project's URL.";
+  'TestSprite executes tests from the cloud, so the runner needs an address it can reach: ' +
+  'a deployed or staging URL. For an app that only runs on this machine, create the project ' +
+  'or environment with `--local <port>` instead of a URL, then run with ' +
+  '`testsprite test run <test-id> --local <port>`.';
 
-type TargetUrlHintContext = 'runtime' | 'bootstrap';
+/**
+ * `0.0.0.0` / `::` bind every interface, so an app listening there IS reachable
+ * on loopback — but the address itself is not loopback and the server refuses
+ * it as a stored URL. Naming the remedy is the whole point of the message.
+ */
+const UNSPECIFIED_ADDRESS_REASON =
+  'the unspecified address (0.0.0.0 / ::) is not allowed — use 127.0.0.1 or ::1 instead';
+
+const LOCAL_PROJECT_CREATE_HINT =
+  'Use --local <port> instead of --url for an app on this machine. ' +
+  'Local projects are frontend-only and require the V3 project platform.';
+
+type TargetUrlHintContext = 'runtime' | 'bootstrap' | 'local-project-create';
 
 export interface TargetUrlCaller {
   /** CLI flag name without the leading `--`, used in the error envelope. */
@@ -133,6 +147,7 @@ export function assertNotLocal(
 }
 
 function localDevHintFor(hintContext: TargetUrlHintContext): string {
+  if (hintContext === 'local-project-create') return LOCAL_PROJECT_CREATE_HINT;
   return hintContext === 'bootstrap' ? LOCAL_DEV_BOOTSTRAP_HINT : LOCAL_DEV_RUNTIME_HINT;
 }
 
@@ -220,9 +235,15 @@ export function disallowedIpReason(host: string): DisallowedIpClassification | u
 }
 
 function disallowedIpv4Reason(address: string): DisallowedIpClassification | undefined {
-  // Unspecified — binds every interface, including loopback.
+  // Unspecified — binds every interface, including loopback. Named precisely
+  // rather than lumped in as "localhost" (DEV-1305): since a loopback URL is
+  // now a legitimate STORED target, calling `0.0.0.0` a localhost target
+  // produced a self-contradicting refusal — "localhost targets are not
+  // allowed" above a hint saying to use `localhost`. It is also simply not
+  // loopback: the server refuses it as a stored URL, so the accurate remedy is
+  // the loopback address the app is also reachable on.
   if (address === '0.0.0.0') {
-    return { reason: 'localhost targets are not allowed', hintKind: 'loopback' };
+    return { reason: UNSPECIFIED_ADDRESS_REASON, hintKind: 'loopback' };
   }
 
   // Only the literal 127.0.0.1 is in `--local-host`'s exact accepted set.
@@ -411,8 +432,13 @@ function reclassifyEmbeddedIpv4(
  * it on the way in rather than trusting every caller to.
  */
 function disallowedIpv6Reason(inner: string): DisallowedIpClassification | undefined {
-  // Loopback (::1) and unspecified (::).
-  if (inner === '::1' || inner === '::') {
+  // Unspecified (`::`) — see `disallowedIpv4Reason`'s note on why this is named
+  // separately from loopback.
+  if (inner === '::') {
+    return { reason: UNSPECIFIED_ADDRESS_REASON, hintKind: 'loopback' };
+  }
+  // Loopback (::1).
+  if (inner === '::1') {
     return { reason: 'localhost targets are not allowed', hintKind: 'loopback' };
   }
   // Embedded-IPv4 family, checked mapped → NAT64 → compatible. Standard /96

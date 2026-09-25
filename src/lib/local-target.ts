@@ -104,6 +104,102 @@ export function normalizeLocalHost(raw: string | undefined): LoopbackHost {
   return match;
 }
 
+/**
+ * `normalizeLocalHost` for a command whose alternative to `--local` is `--url`
+ * (`project create/update`, `project env create/update`) rather than
+ * `--target-url`, so the refusal names the flag that command actually has.
+ */
+export function normalizeStoredLocalHost(raw: string | undefined): LoopbackHost {
+  try {
+    return normalizeLocalHost(raw);
+  } catch (err) {
+    if (err instanceof ApiError && typeof err.details?.reason === 'string') {
+      throw localValidationError(
+        'local-host',
+        err.details.reason.replace('--target-url', '--url'),
+        err.details.accepted,
+      );
+    }
+    throw err;
+  }
+}
+
+/** The target `--local <port> [--local-host]` names on a project or environment write. */
+export interface StoredLocalTarget {
+  host: LoopbackHost;
+  port: number;
+}
+
+/**
+ * Parse the `--local` / `--local-host` / `--url` trio a stored-target write
+ * takes. `--local` and `--url` are two spellings of one field, so both is a
+ * contradiction; `--local-host` only means something next to `--local`; the
+ * port is validated strictly because it becomes part of a URL runs are billed
+ * against. Returns the local target, or `undefined` when `--url` (or nothing)
+ * was given.
+ */
+export function parseStoredLocalTarget(opts: {
+  local?: string;
+  localHost?: string;
+  url?: string;
+}): StoredLocalTarget | undefined {
+  if (opts.local !== undefined && opts.url !== undefined) {
+    throw flagPairError('--local and --url are mutually exclusive');
+  }
+  if (opts.localHost !== undefined && opts.local === undefined) {
+    throw flagPairError('--local-host requires --local');
+  }
+  if (opts.local === undefined) return undefined;
+  if (!/^\d+$/.test(opts.local)) {
+    throw flagPairError('--local must be a port number between 1 and 65535');
+  }
+  return { host: normalizeStoredLocalHost(opts.localHost), port: parseLocalPort(opts.local) };
+}
+
+function flagPairError(message: string): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request.',
+      nextAction: message,
+      requestId: 'local',
+      details: { reason: 'missing_required_flag' },
+    },
+  });
+}
+
+/**
+ * Refuse a stored-target write whose loopback port has nothing listening —
+ * the same check `project create --local` runs, so a typo in the port is
+ * caught before a row exists anywhere. `skipPreflight` is a pure no-op.
+ */
+export async function assertStoredLocalTargetListening(
+  target: StoredLocalTarget,
+  opts: { skipPreflight?: boolean },
+  deps: LocalPortProbeDeps = {},
+): Promise<void> {
+  if (opts.skipPreflight) return;
+  const outcome = await probeLocalPort(target.host, target.port, deps);
+  if (outcome.verdict === 'refuse') {
+    const targetUrl = buildLocalTargetUrl(target.host, target.port);
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: `Nothing is listening on ${targetUrl}. Start your app first, or pass --skip-preflight.`,
+        nextAction: 'Verify --local and --local-host match the app you want to test.',
+        requestId: 'local',
+        details: {
+          field: 'local',
+          reason: 'local-port-not-listening',
+          host: target.host,
+          port: target.port,
+          probeReason: outcome.reason,
+        },
+      },
+    });
+  }
+}
+
 /** `http://<host>:<port>`, with IPv6 bracketed as the URL grammar requires. */
 export function buildLocalTargetUrl(host: LoopbackHost, port: number): string {
   const authority = host.includes(':') ? `[${host}]` : host;

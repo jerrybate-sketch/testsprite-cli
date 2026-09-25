@@ -22,7 +22,13 @@ import {
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from '../lib/gh-output.js';
-import { describeConflict, summarizeConflicts } from '../lib/conflict-reason.js';
+import {
+  describeConflict,
+  insufficientCreditsConflictError,
+  isAllCreditsRefusal,
+  summarizeConflicts,
+} from '../lib/conflict-reason.js';
+import { recordBatchOutcome } from '../lib/telemetry.js';
 import { formatRunProgressLine } from '../lib/run-progress.js';
 import { createTicker } from '../lib/ticker.js';
 import {
@@ -535,6 +541,12 @@ export async function runTestlistRun(
   // flows through the tail below so its CI artifacts are still emitted.
   if (resp.accepted.length === 0 && resp.conflicts.length > 0) {
     out.print(resp, () => renderRunAcceptedText(resp));
+    recordBatchOutcome({
+      accepted: 0,
+      conflicts: resp.conflicts,
+      deferred: resp.deferred.length,
+      skipped: 0,
+    });
     // Surface the exit-6 in CI too (only under --wait, the CI-artifact contract):
     // an all-conflict re-run — every targeted case already in flight — otherwise
     // exits 6 with no ::error:: annotation and no summary file. The conflicts fold
@@ -564,6 +576,12 @@ export async function runTestlistRun(
         'testlist run',
       );
     }
+    // Every case refused for credits → exit 12, the same INSUFFICIENT_CREDITS
+    // envelope the single-run route answers (a rate-deferred remainder is exit 7
+    // below; `isAllCreditsRefusal` requires an empty deferred set).
+    if (isAllCreditsRefusal(resp)) {
+      throw insufficientCreditsConflictError(resp.conflicts, client.resolvedBaseUrl);
+    }
     const pollIds = resp.conflicts
       .map(c => c.currentRunId)
       .filter((id): id is string => Boolean(id));
@@ -586,6 +604,12 @@ export async function runTestlistRun(
         ? renderRunAcceptedText(resp)
         : `No runs dispatched${resp.reason ? ` (${resp.reason})` : ''}.`,
     );
+    recordBatchOutcome({
+      accepted: resp.accepted.length,
+      conflicts: resp.conflicts,
+      deferred: resp.deferred.length,
+      skipped: 0,
+    });
     assertNoDeferred(resp);
     assertNoNotFound(resp);
     return resp;
@@ -749,6 +773,13 @@ export async function runTestlistRun(
   }
 
   out.print(jsonPayload, () => results.map(r => `${r.runId}  ${r.status}`).join('\n'));
+  recordBatchOutcome({
+    accepted: resp.accepted.length,
+    conflicts: resp.conflicts,
+    deferred: resp.deferred.length,
+    skipped: 0,
+    results,
+  });
 
   // CI-native output parity with `test run` (--gh-output / --summary-file):
   // auto-enable under GITHUB_ACTIONS. Emit BEFORE the exit-code gates below so a
@@ -1051,11 +1082,11 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with --wait: emit GitHub-native output (::error:: annotations per non-passed member; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with --wait: emit GitHub-native output (::error:: annotations for failed/timed-out members, ::warning:: for never-dispatched ones; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+      'with --wait: also write the reduced machine summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(

@@ -24,6 +24,22 @@ export interface TriggerRunBody {
    * dropping the field.
    */
   tunnelClientId?: string;
+  /**
+   * DEV-1305: the NAME of the project environment whose credentials, auto-auth
+   * and OTP settings this run should use (`unique(project_id, name)` server
+   * side). Absent → the project's default environment, exactly as before.
+   * Composes with `targetUrl`/`tunnelClientId`: those pick WHERE the browser
+   * goes, this picks WHOSE credentials it logs in with.
+   */
+  environment?: string;
+}
+
+/** The environment a run resolved to — its credentials, its config, its address. */
+export interface RunEnvironmentRef {
+  /** `test_environment.id`; null when the row keeps only the denormalised name. */
+  id: string | null;
+  /** Environment name at seed time; null on an id-only row. */
+  name: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +57,8 @@ export interface RerunRequest {
   autoHeal?: boolean;
   /** BE only: rerun only the named test without expanding the producer/teardown closure. */
   skipDependencies?: boolean;
+  /** See `TriggerRunBody.environment` — the named environment to replay against. */
+  environment?: string;
 }
 
 /** One closure member returned in `RerunResponse.closure.members[]`. */
@@ -115,6 +133,8 @@ export interface BatchRerunRequest {
   testIds: string[];
   autoHeal?: boolean;
   skipDependencies?: boolean;
+  /** See `TriggerRunBody.environment` — applied to every test in the batch. */
+  environment?: string;
 }
 
 /** One accepted run in the batch rerun response. */
@@ -185,6 +205,11 @@ export interface TriggerRunResponse {
   codeVersion: string;
   /** Resolved target URL (project default when --target-url absent). */
   targetUrl: string;
+  /**
+   * The environment this run resolved to. Absent on an older backend; `null`
+   * when the server resolved no environment row.
+   */
+  environment?: RunEnvironmentRef | null;
   /**
    * Portal deep link for the run's test, built by the server for the store
    * that dispatched it. Present-or-absent (never null): an older backend, a
@@ -267,6 +292,11 @@ export interface RunResponse {
    * (`RunEnvelope.targetUrl` is `[string, 'null']`).
    */
   targetUrl: string | null;
+  /**
+   * The environment this run resolved to. Absent on an older backend (or a
+   * V2-served run); `null` when the row names no environment.
+   */
+  environment?: RunEnvironmentRef | null;
   createdFrom: string | null;
   failedStepIndex: number | null;
   failureKind: string | null;
@@ -316,6 +346,13 @@ export interface RunResponse {
 // DEV-331 piece 3 — cancel wire types
 // ---------------------------------------------------------------------------
 
+/** Credit outcome returned when cancellation applies V3 frontend billing rules. */
+export interface CancelRunRefund {
+  status: 'refunded' | 'not_charged' | 'failed';
+  /** Original charged amount returned to the workspace. Present when refunded. */
+  amount?: number;
+}
+
 /**
  * Response from `POST /api/cli/v1/runs/{runId}/cancel`.
  * Same shape as `GET /runs/{runId}` (`status: "cancelled"`, verdict
@@ -324,6 +361,11 @@ export interface RunResponse {
  */
 export interface CancelRunResponse extends RunResponse {
   alreadyCancelled: boolean;
+  /**
+   * Present only when the server evaluated a V3 frontend run refund. Older
+   * backends, V2 runs, and backend-test runs omit it.
+   */
+  refund?: CancelRunRefund;
 }
 
 /** Terminal states from the RunStatus union. */
@@ -390,11 +432,15 @@ export interface RunHistoryItem {
   targetUrl?: string | null;
   /**
    * G1b — provenance of `targetUrl`.
-   * - `'run'`: stamped at run-trigger time (authoritative).
+   * - `'run'`: stamped at run-trigger time (authoritative; V2).
    * - `'unresolved'`: backend could not resolve a URL for this run.
-   * - `null` / absent: pre-G1b backend; treat as unknown.
+   * - `null`: a V3 run — the environment in `environment` IS the target and
+   *   `targetUrl` is its address, so there is no separate provenance.
+   * - absent: pre-G1b backend; treat as unknown.
    */
   targetUrlSource?: 'run' | 'unresolved' | null;
+  /** The environment this run resolved to. Absent on older backends. */
+  environment?: RunEnvironmentRef | null;
 }
 
 /**
@@ -438,6 +484,8 @@ export interface ListRunsQuery {
   source?: RunSource;
   /** ISO timestamp (after client-side duration parsing). */
   since?: string;
+  /** DEV-1306: only runs whose credentials came from this environment (by name). */
+  environment?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +501,8 @@ export interface BatchRunFreshRequest {
   projectId: string;
   testIds?: string[];
   source: 'cli';
+  /** See `TriggerRunBody.environment` — applied to every test in the batch. */
+  environment?: string;
 }
 
 /** One accepted run in the batch fresh-run response. */

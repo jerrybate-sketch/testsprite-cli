@@ -702,3 +702,87 @@ describe('disallowedIpReason — called directly, as the DNS path calls it', () 
     expect(disallowedIpReason(address)).toBeUndefined();
   });
 });
+
+describe('assertNotLocal — local project creation guidance', () => {
+  it.each(['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000'])(
+    'redirects project creation for %s to --local',
+    targetUrl => {
+      let error: unknown;
+      try {
+        assertNotLocal(targetUrl, {
+          field: 'url',
+          helpCommand: 'testsprite project create',
+          hintContext: 'local-project-create',
+        });
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(ApiError);
+      if (!(error instanceof ApiError)) throw new Error('expected local target refusal');
+      expect(error.exitCode).toBe(5);
+      expect(error.nextAction).toContain(
+        'Use --local <port> instead of --url for an app on this machine',
+      );
+      expect(error.nextAction).not.toContain('must be an internet-reachable address');
+      expect(error.nextAction).toContain('See `testsprite project create --help`');
+      expect(error.details?.hint).toContain('Use --local <port> instead of --url');
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Stored-URL refusals (DEV-1305): the unspecified addresses are named for what
+// they are, and the caller's flag/help command ride into the envelope.
+// ---------------------------------------------------------------------------
+
+describe('assertNotLocal — stored-URL wording', () => {
+  // A loopback URL is a legitimate stored target now (written via `--local
+  // <port>`), which turned the old "localhost targets are not allowed" text
+  // into a self-contradicting refusal for the bind-all addresses: it sat above
+  // a hint telling the reader to use a loopback address. They are named for
+  // what they are, with the remedy in the text.
+  it.each(['http://0.0.0.0:5173', 'http://[::]:5173'])(
+    '%s is refused as the UNSPECIFIED address, not as localhost',
+    url => {
+      try {
+        assertNotLocal(url, {
+          field: 'url',
+          helpCommand: 'testsprite project create',
+          hintContext: 'local-project-create',
+        });
+        throw new Error('expected a rejection');
+      } catch (err) {
+        const apiErr = err as ApiError;
+        expect(apiErr).toBeInstanceOf(ApiError);
+        expect(apiErr.message).toContain('the unspecified address (0.0.0.0 / ::) is not allowed');
+        expect(apiErr.message).toContain('use 127.0.0.1 or ::1 instead');
+        expect(apiErr.message).not.toContain('localhost targets are not allowed');
+      }
+    },
+  );
+
+  it('a real loopback address keeps its own wording on the RUN path', () => {
+    try {
+      assertNotLocal('http://localhost:3000', { field: 'target-url', helpCommand: 'x' });
+      throw new Error('expected a rejection');
+    } catch (err) {
+      expect((err as ApiError).message).toContain('localhost targets are not allowed');
+    }
+  });
+
+  it('carries the caller’s field and help command into the rejection', () => {
+    try {
+      assertNotLocal('http://10.0.0.5', {
+        field: 'url',
+        helpCommand: 'testsprite project create',
+        hintContext: 'bootstrap',
+      });
+      throw new Error('expected a rejection');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+      expect((err as ApiError).nextAction).toContain('testsprite project create');
+      expect((err as ApiError).details).toMatchObject({ field: 'url' });
+    }
+  });
+});

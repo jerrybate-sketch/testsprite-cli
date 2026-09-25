@@ -1,5 +1,5 @@
 /**
- * Valibot schemas for the run-path and test-code wire shapes (#102, #277).
+ * Valibot schemas for the API wire shapes (issue #102, extended by #277).
  *
  * `requestWithMeta` used to return `(await response.json()) as T` with zero
  * runtime validation, so a drifted or partial server response surfaced as
@@ -31,13 +31,21 @@
  * interface it mirrors, so schema/interface drift fails `tsc` in this file.
  */
 import * as v from 'valibot';
+// Type-only imports: erased at compile time, so pulling a command's wire
+// interface into `lib/` adds no runtime edge (same pattern as `bundle.ts`,
+// which type-imports `CliTestStep` from `commands/test.ts`).
+import type { MeResponse } from '../commands/auth.js';
+import type { UsageResponse } from '../commands/usage.js';
 import type {
   BatchRerunResponse,
   BatchRunFreshResponse,
+  CancelRunRefund,
+  CancelRunResponse,
   ListRunsResponse,
   RerunAdvisory,
   RerunClosure,
   RerunResponse,
+  RunEnvironmentRef,
   RunResponse,
   RunSource,
   RunStatus,
@@ -47,6 +55,9 @@ import type { CliTestListRunResponse } from './testlist.types.js';
 import type { TunnelMintResponse, TunnelStatusResponse } from './tunnel.types.js';
 import type { ConflictReason } from './conflict-reason.js';
 import type { CliTestCodeRead } from '../commands/test.js';
+
+/** Deployment environment the bound key belongs to; open on the wire (rule 2). */
+type AccountEnv = 'development' | 'staging' | 'production';
 
 /**
  * Compile-time literal union, runtime open string.
@@ -77,6 +88,18 @@ export const CLI_TEST_CODE_SCHEMA: v.GenericSchema<unknown, CliTestCodeRead> = v
   etag: v.optional(v.nullable(v.string())),
 });
 
+/**
+ * Mirrors `RunEnvironmentRef` (runs.types.ts): the environment a run resolved to.
+ * Optional + nullable everywhere it appears: absent on an older backend, `null`
+ * when the row carries no stamp — both mean "unknown" to every renderer.
+ */
+const RUN_ENVIRONMENT_REF_SCHEMA: v.GenericSchema<unknown, RunEnvironmentRef> = v.looseObject({
+  // Either half may be null: a backfilled row whose environment was deleted
+  // keeps the denormalised name but no id, and a pre-name row keeps the id only.
+  id: v.nullable(v.string()),
+  name: v.nullable(v.string()),
+});
+const OPTIONAL_ENVIRONMENT_SCHEMA = v.optional(v.nullable(RUN_ENVIRONMENT_REF_SCHEMA));
 // ---------------------------------------------------------------------------
 // GET /runs/{runId}
 // ---------------------------------------------------------------------------
@@ -123,6 +146,8 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   // when either is null (rule 3).
   codeVersion: v.nullish(v.string(), null),
   targetUrl: v.nullish(v.string(), null),
+  // The run's environment — optional with no default (rule 3, optional branch).
+  environment: OPTIONAL_ENVIRONMENT_SCHEMA,
   createdFrom: v.nullish(v.string(), null),
   failedStepIndex: v.nullish(v.number(), null),
   failureKind: v.nullish(v.string(), null),
@@ -171,6 +196,27 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
 });
 
 // ---------------------------------------------------------------------------
+// POST /runs/{runId}/cancel
+// ---------------------------------------------------------------------------
+
+/** Mirrors `CancelRunRefund` (runs.types.ts): optional V3 frontend refund result. */
+const CANCEL_RUN_REFUND_SCHEMA: v.GenericSchema<unknown, CancelRunRefund> = v.looseObject({
+  status: openWireLiteral<CancelRunRefund['status']>(),
+  amount: v.optional(v.number()),
+});
+
+/** Mirrors `CancelRunResponse` (runs.types.ts): the run envelope plus cancel metadata. */
+export const CANCEL_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, CancelRunResponse> = v.intersect([
+  RUN_RESPONSE_SCHEMA,
+  v.looseObject({
+    alreadyCancelled: v.boolean(),
+    // Older backends, V2 runs, and backend-test runs omit this field. No
+    // default: absence must stay absent so JSON output passes through unchanged.
+    refund: v.optional(CANCEL_RUN_REFUND_SCHEMA),
+  }),
+]);
+
+// ---------------------------------------------------------------------------
 // POST /tests/{testId}/runs
 // ---------------------------------------------------------------------------
 
@@ -182,6 +228,8 @@ export const TRIGGER_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, TriggerRunRes
     enqueuedAt: v.string(),
     codeVersion: v.string(),
     targetUrl: v.string(),
+    // The run's environment — optional with no default (rule 3, optional branch).
+    environment: OPTIONAL_ENVIRONMENT_SCHEMA,
     // Server-built portal links (backend ≥ the run-links change). Optional
     // with no default (rule 3): an older backend omits them, and a V3 run
     // the server could not link stays ABSENT — the renderer prints a
@@ -354,6 +402,8 @@ const RUN_HISTORY_ITEM_SCHEMA = v.looseObject({
   // G1b fields: optional on the wire for back-compat with older backends.
   targetUrl: v.optional(v.nullable(v.string())),
   targetUrlSource: v.optional(v.nullable(openWireLiteral<'run' | 'unresolved'>())),
+  // The run's environment — optional with no default.
+  environment: OPTIONAL_ENVIRONMENT_SCHEMA,
 });
 
 /** Mirrors `ListRunsResponse` (runs.types.ts): `GET /tests/{testId}/runs`. */
@@ -376,17 +426,23 @@ export const LIST_RUNS_RESPONSE_SCHEMA: v.GenericSchema<unknown, ListRunsRespons
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal `/me` identity core shared by its consumers. `doctor` reads a
- * two-field optional projection (`MeIdentity` in commands/doctor.ts) while
- * `auth whoami` reads the full `MeResponse` (commands/auth.ts); this schema
- * validates the common identity core so it can guard either caller, and
- * `looseObject` lets the full projection (scopes, env, email, ...) pass
- * through untouched. Not wired into any typed helper yet: `/me` callers use
- * the generic `get`, which stays schema-free in this change.
+ * Minimal `/me` identity core, as read by `doctor`'s connectivity check.
+ *
+ * `doctor` deliberately treats every field as optional: the check only needs
+ * "the key was accepted", and it decorates the detail line with the userId
+ * *when present* (`me.userId ? ...`). Fixture evidence for keeping it fully
+ * optional rather than reusing {@link ME_RESPONSE_SCHEMA}: `OK_ME` in
+ * `commands/doctor.test.ts` is `{ userId, keyId }` with no `scopes`/`env`, and
+ * a connectivity probe must not fail on a partial identity projection.
+ *
+ * `commands/doctor.ts` aliases its `MeIdentity` to this type so the two cannot
+ * drift (they already had: `v3Enabled` existed on the command side only).
  */
 export interface MeIdentityWire {
   userId?: string;
   keyId?: string;
+  /** Authoritative per-user V3 routing bit; older backends omit it. */
+  v3Enabled?: boolean;
   /**
    * Account-wide organization membership list (mirrors `CliOrgSummary` in
    * `lib/org-render.ts`). Optional/absent-safe: omitted on a server-side
@@ -420,8 +476,61 @@ const ORG_BINDING_SCHEMA = v.looseObject({
 export const ME_IDENTITY_SCHEMA: v.GenericSchema<unknown, MeIdentityWire> = v.looseObject({
   userId: v.optional(v.string()),
   keyId: v.optional(v.string()),
+  v3Enabled: v.optional(v.boolean()),
   organizations: v.optional(v.array(ORG_SUMMARY_SCHEMA)),
   org: v.optional(ORG_BINDING_SCHEMA),
+});
+
+/**
+ * Mirrors `MeResponse` (commands/auth.ts): the full `GET /me` projection read
+ * by `auth whoami` (and, through it, `init`).
+ *
+ * `scopes` is required and array-typed on purpose — this is the shape drift
+ * that actually bites today. `runWhoami` renders `m.scopes.join(', ')` and
+ * computes `missingScopes` via `m.scopes.includes(...)` with no guard, so a
+ * `/me` body without `scopes` crashes with a raw `TypeError` (exit 1) instead
+ * of a typed envelope. Every `/me` fixture in the suite supplies it
+ * (`auth.test.ts`, `init.test.ts`, `usage.test.ts`, `cli.subprocess.test.ts`,
+ * `test/mock-backend/fixtures.ts`), so requiring it matches observed wire
+ * reality; `email` / `displayName` / `v3Enabled` are the genuinely absent-safe
+ * ones and stay `v.optional` with no default (rule 3, optional branch).
+ *
+ * `init` calls this through `runWhoami` inside a try/catch that falls back to
+ * a placeholder identity, so a drifted `/me` degrades the setup summary
+ * instead of failing the whole `init`.
+ */
+export const ME_RESPONSE_SCHEMA: v.GenericSchema<unknown, MeResponse> = v.looseObject({
+  userId: v.string(),
+  keyId: v.string(),
+  scopes: v.array(v.string()),
+  env: openWireLiteral<AccountEnv>(),
+  email: v.optional(v.string()),
+  displayName: v.optional(v.string()),
+  v3Enabled: v.optional(v.boolean()),
+});
+
+// ---------------------------------------------------------------------------
+// GET /me (usage projection)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors `UsageResponse` (commands/usage.ts): the credits/plan projection the
+ * `usage` command reads off the same `GET /me` body.
+ *
+ * `renderUsage` prints `userId`/`keyId`/`env` unconditionally as its "identity
+ * block", so those three are required; `credits`, `subPlan` and
+ * `creditsPerRun` are forward-compat fields the backend does not send today
+ * (see the BACKEND FOLLOW-UP note in usage.ts) and every renderer branch is
+ * gated on `!== undefined`, so they stay optional with no default. `scopes`
+ * rides along as an unknown extra key and is preserved by `looseObject`.
+ */
+export const USAGE_RESPONSE_SCHEMA: v.GenericSchema<unknown, UsageResponse> = v.looseObject({
+  userId: v.string(),
+  keyId: v.string(),
+  env: openWireLiteral<AccountEnv>(),
+  credits: v.optional(v.number()),
+  subPlan: v.optional(v.string()),
+  creditsPerRun: v.optional(v.number()),
 });
 
 // ---------------------------------------------------------------------------
@@ -443,6 +552,7 @@ export const TUNNEL_MINT_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelMintRes
     secret: v.pipe(v.string(), v.minLength(1)),
     controlUrl: v.pipe(v.string(), v.minLength(1)),
     tunnelAddr: v.pipe(v.string(), v.minLength(1)),
+    tunnelTlsAddr: v.optional(v.pipe(v.string(), v.minLength(1))),
     expiresAt: v.string(),
   });
 

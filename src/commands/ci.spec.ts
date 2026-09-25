@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildGithubWorkflow,
   createCiCommand,
@@ -17,6 +17,7 @@ import {
   type SpawnImpl,
 } from './ci.js';
 import { ApiError } from '../lib/errors.js';
+import { takeTelemetryExtras } from '../lib/telemetry.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
@@ -526,5 +527,66 @@ describe('runCiInit with the real fs seam', () => {
         stderr: () => {},
       }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+});
+
+// ── telemetry facts ──────────────────────────────────────────────────────────
+
+describe('ci init telemetry facts', () => {
+  beforeEach(() => {
+    takeTelemetryExtras();
+  });
+  afterEach(() => {
+    takeTelemetryExtras();
+  });
+
+  it('fresh write: platform + force + workflowExisted:false + projectResolved:auto (auto-detected)', async () => {
+    const fetchImpl = makeFetch(() => ({ body: projectsBody(['only']) }));
+    await runCiInit(opts(), deps({ fetchImpl }));
+    expect(takeTelemetryExtras()).toEqual({
+      platform: 'github',
+      force: false,
+      workflowExisted: false,
+      projectResolved: 'auto',
+    });
+  });
+
+  it('--force over an existing workflow: workflowExisted:true + projectResolved:flag', async () => {
+    const fs = makeFakeFs({ [WF]: 'old contents' });
+    await runCiInit(opts({ project: 'p', force: true }), deps({ fs }));
+    expect(takeTelemetryExtras()).toEqual({
+      platform: 'github',
+      force: true,
+      workflowExisted: true,
+      projectResolved: 'flag',
+    });
+  });
+
+  it('refused clobber (exists, no --force) still records workflowExisted:true on the error path', async () => {
+    await expect(
+      runCiInit(opts({ project: 'p' }), deps({ fs: makeFakeFs({ [WF]: 'old contents' }) })),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(takeTelemetryExtras()).toEqual({
+      platform: 'github',
+      force: false,
+      workflowExisted: true,
+      projectResolved: 'flag',
+    });
+  });
+
+  it('--dry-run probes nothing, so workflowExisted is omitted', async () => {
+    await runCiInit(opts({ dryRun: true }), deps());
+    expect(takeTelemetryExtras()).toEqual({
+      platform: 'github',
+      force: false,
+      projectResolved: 'auto',
+    });
+  });
+
+  it('an unsupported platform records nothing (refused before the scaffold)', async () => {
+    await expect(runCiInit(opts({ platform: 'gitlab' }), deps())).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+    });
+    expect(takeTelemetryExtras()).toEqual({});
   });
 });

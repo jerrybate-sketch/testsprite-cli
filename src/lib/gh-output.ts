@@ -6,12 +6,13 @@ import { appendFileSync, writeFileSync } from 'node:fs';
  * single `test run <test-id> --wait` and the `test run --all --wait` batch.
  *
  * A `--wait` run presents its result in the formats CI consumes:
- *   (a) a stable machine summary `{total, passed, failed, timedOut, runs[]}`
- *       written to `--summary-file <path>` when requested,
+ *   (a) a stable machine summary `{total, passed, failed, skipped, timedOut,
+ *       runs[]}` written to `--summary-file <path>` when requested,
  *   (b) a Markdown results table appended to `$GITHUB_STEP_SUMMARY` when
  *       running under GitHub Actions,
- *   (c) one `::error::` workflow-command line per non-passed run so failures
- *       annotate the PR checks tab.
+ *   (c) one workflow-command line per non-passed run so it annotates the PR
+ *       checks tab — `::error::` for a dispatched run that failed or timed
+ *       out, `::warning::` for a test that never dispatched.
  * Activation: `GITHUB_ACTIONS=true` in the environment, or the explicit
  * `--gh-output` flag (which forces the annotations even off-Actions, so the
  * behavior is previewable locally). All writes are best-effort: a broken
@@ -35,9 +36,31 @@ export interface CiSummary {
   total: number;
   passed: number;
   failed: number;
+  /**
+   * Requested tests that never dispatched (deferred / conflict / not_found /
+   * skipped / no_tests rows). Kept OUT of `failed`: `failed` claiming
+   * a test failed while the exit code says otherwise is the artifacts-disagree
+   * bug this field fixes. Non-dispatch still gates the exit where it should
+   * (deferred → 7, all-conflict → 6, all-not-found rerun → 4, zero-dispatch → 5).
+   */
+  skipped: number;
   timedOut: number;
   runs: CiRunRow[];
 }
+
+/**
+ * Row statuses that mean "this test never ran" as opposed to "this run did not
+ * pass". They count as `skipped` in the summary (not `failed`) and annotate as
+ * `::warning::` (not `::error::`) so every CI surface tells the same story as
+ * the exit code.
+ */
+const NON_DISPATCHED_STATUSES: ReadonlySet<string> = new Set([
+  'deferred',
+  'conflict',
+  'not_found',
+  'skipped',
+  'no_tests',
+]);
 
 /**
  * Reduce a non-dispatched bucket (`deferred` / `conflicts` / `notFound`) into
@@ -69,11 +92,13 @@ function bucketRows(bucket: unknown, status: string, note: string): CiRunRow[] {
  * after a timeout) reduces to an empty run list rather than a crash.
  *
  * Non-dispatched work (`deferred` / `conflicts` / `notFound`) is folded in as
- * non-passed rows: those buckets already force a non-zero exit (deferred /
- * timeout → 7, all-conflict → 6) but were previously absent from the summary,
- * so a partial batch like `1 accepted passed + 1 deferred` read as "1/1 passed"
- * with no annotation. (`skippedFrontend` / `skippedIntegration` are NOT folded
- * in — they exit 0 and are the Action layer's allow-partial concern.)
+ * non-passed rows so a partial batch like `1 accepted passed + 1 deferred`
+ * cannot read as "1/1 passed" with no annotation — but it counts as `skipped`,
+ * never `failed`: whether non-dispatch fails the job is the exit-code
+ * gates' call, and a `failed` count the gates disagree with is exactly the
+ * artifacts-contradict-the-exit bug. (`skippedFrontend` / `skippedIntegration`
+ * are NOT folded in — they exit 0 and are the Action layer's allow-partial
+ * concern.)
  */
 export function summarizeAcceptedPayload(
   capturedJson: string,
@@ -131,8 +156,9 @@ export function summarizeAcceptedPayload(
   ];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
-  const failed = rows.length - passed - timedOut;
-  return { total: rows.length, passed, failed, timedOut, runs: rows };
+  const skipped = rows.filter(row => NON_DISPATCHED_STATUSES.has(row.status)).length;
+  const failed = rows.length - passed - timedOut - skipped;
+  return { total: rows.length, passed, failed, skipped, timedOut, runs: rows };
 }
 
 /**
@@ -162,8 +188,9 @@ export function summarizeSingleRun(run: {
   };
   const passed = row.status === 'passed' ? 1 : 0;
   const timedOut = row.status === 'timeout' ? 1 : 0;
-  const failed = 1 - passed - timedOut;
-  return { total: 1, passed, failed, timedOut, runs: [row] };
+  const skipped = NON_DISPATCHED_STATUSES.has(row.status) ? 1 : 0;
+  const failed = 1 - passed - timedOut - skipped;
+  return { total: 1, passed, failed, skipped, timedOut, runs: [row] };
 }
 
 /**
@@ -216,7 +243,7 @@ export function renderJobSummaryMarkdown(summary: CiSummary): string {
   return [
     '## TestSprite results',
     '',
-    `**${summary.passed}/${summary.total} passed** (${summary.failed} failed, ${summary.timedOut} timed out)`,
+    `**${summary.passed}/${summary.total} passed** (${summary.failed} failed, ${summary.skipped} skipped, ${summary.timedOut} timed out)`,
     '',
     '| Test | Status | Run |',
     '| --- | --- | --- |',
@@ -268,8 +295,11 @@ function escapeCommandProperty(value: string): string {
 /**
  * Emit the GitHub-native surfaces. Self-gating on the standard env vars:
  * `$GITHUB_STEP_SUMMARY` (a file path Actions provides) receives the Markdown
- * table; `GITHUB_ACTIONS=true` enables one `::error::` workflow command per
- * non-passed run on stdout (Actions parses workflow commands from stdout).
+ * table; `GITHUB_ACTIONS=true` enables one workflow command per non-passed run
+ * on stdout (Actions parses workflow commands from stdout) — `::error::` for a
+ * dispatched run that failed or timed out, `::warning::` for a test that never
+ * ran (deferred / conflict / not_found / skipped), so a red annotation always
+ * means a red-worthy outcome and never contradicts the exit code.
  * `force` (the `--gh-output` flag) emits the annotations even off-Actions;
  * the step summary still requires the env-provided file path to exist.
  * Both writes are best-effort: a broken summary file must not mask the gate.
@@ -314,7 +344,10 @@ export function emitGithubOutputs(
       // able to smuggle a second workflow command into the Actions stream.
       const title = `TestSprite ${escapeCommandProperty(row.title?.trim() || row.testId)}`;
       const message = escapeCommandData(`status=${row.status}${detail}${link}`);
-      annotate(`::error title=${title}::${message}`);
+      // Severity mirrors the summary counters: never-dispatched rows are
+      // warnings (they may not even gate the exit), real failures are errors.
+      const severity = NON_DISPATCHED_STATUSES.has(row.status) ? 'warning' : 'error';
+      annotate(`::${severity} title=${title}::${message}`);
     }
   }
 }
